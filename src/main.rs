@@ -23,10 +23,12 @@ const APPNAME: &'static str = "imphand";
 
 struct Filter {
     subject: String,
+    from: String,
 }
 
 struct ReFilter {
     subject: Regex,
+    from: Regex,
 }
 
 fn main() {
@@ -112,14 +114,29 @@ fn subscribe(imap: ImapServer) {
 
     let mut filters: Vec<Filter> = vec![];
     let mut refilters: Vec<ReFilter> = vec![];
-    filters.push(Filter { subject: r".*に資料が追加されました。".to_string() });
-    filters.push(Filter { subject: r".*さんが.*に参加登録しました。".to_string() });
+    filters.push(Filter {
+        subject: r".*に資料が追加されました。".to_string(),
+        from: r"no-reply@connpass.com".to_string(),
+    });
+    filters.push(Filter {
+        subject: r".*さんが.*に参加登録しました。".to_string(),
+        from: r"no-reply@connpass.com".to_string(),
+    });
+    filters.push(Filter {
+        subject: r".*が.*を公開しました".to_string(),
+        from: r"no-reply@connpass.com".to_string(),
+    });
     for filter in filters {
         let re_subject = match Regex::new(filter.subject.as_ref()) {
             Ok(re) => re,
             Err(e) => panic!("failed to compile regex: {}", e),
         };
-        refilters.push(ReFilter { subject: re_subject });
+        let re_from = match Regex::new(filter.from.as_ref()) {
+            Ok(re) => re,
+            Err(e) => panic!("failed to compile regex: {}", e),
+        };
+        refilters.push(ReFilter { subject: re_subject,
+        from: re_from});
     }
 
     let mut delete_targets: Vec<u32> = vec![];
@@ -195,6 +212,7 @@ fn notify_matching_email(imap_socket: &mut IMAPStream,
             // Using regex implementation
             use std::io::{Read, Write};
 
+            // Fetch subject header
             let re = match Regex::new(r"Subject: (?P<value>\S+(\r\n\s+\S+)*)") {
                 Ok(re) => re,
                 Err(e) => panic!("failed to compile regex: {}", e),
@@ -238,8 +256,54 @@ fn notify_matching_email(imap_socket: &mut IMAPStream,
                 }
                 None => panic!("child.stdout is None"),
             }
+
+            // Fetch from header
+            let re = match Regex::new(r"From: .*<(?P<value>.*)>") {
+                Ok(re) => re,
+                Err(e) => panic!("failed to compile regex: {}", e),
+            };
+            let value = match re.captures(s.as_ref()) {
+                Some(caps) => {
+                    match caps.name("value") {
+                        Some(cap) => cap.as_str(),
+                        None => "",
+                    }
+                }
+                None => "",
+            };
+            let value = value.to_string().replace("\r\n", "");
+            let value = value.to_string().replace(" ", "");
+            let child = match process::Command::new("nkf")
+                .args(&["-w"])
+                .stdin(process::Stdio::piped())
+                .stdout(process::Stdio::piped())
+                .spawn() {
+                Ok(child) => child,
+                Err(e) => panic!("failed to spawn process: {}", e),
+            };
+            match child.stdin {
+                Some(mut stdin) => {
+                    match stdin.write_all(&value.as_bytes()) {
+                        Ok(_) => (),
+                        Err(e) => panic!("failed to write child.stdin: {}", e),
+                    }
+                }
+                None => panic!("child.stdin is None"),
+            }
+            let mut from = String::new();
+            match child.stdout {
+                Some(mut stdout) => {
+                    match stdout.read_to_string(&mut from) {
+                        Ok(_) => (),
+                        Err(e) => panic!("failed to read stdout: {}", e),
+                    }
+                    ()
+                }
+                None => panic!("child.stdout is None"),
+            }
+
             for (i, refilter) in refilters.iter().enumerate() {
-                if refilter.subject.is_match(subject.as_ref()) {
+                if refilter.subject.is_match(subject.as_ref()) && refilter.from.is_match(from.as_str()) {
                     notification(subject.as_ref());
                     let command = format!("STORE {} +FLAGS (\\Seen)", message_id);
                     match imap_socket.run_command(command.as_ref()) {
