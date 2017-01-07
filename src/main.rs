@@ -21,6 +21,14 @@ const SUMMARY: &'static str = "Category:email";
 const ICON: &'static str = "thunderbird-bin-icon";
 const APPNAME: &'static str = "imphand";
 
+struct Filter {
+    subject: String,
+}
+
+struct ReFilter {
+    subject: Regex,
+}
+
 fn main() {
     let imap = ImapServer {
         server: "example.com".to_string(),
@@ -34,13 +42,14 @@ fn main() {
 
 fn notification(body: &str) {
     Notification::new()
-    .summary(SUMMARY)
-    .body(body)
-    .icon(ICON)
-    .appname(APPNAME)
-    .hint(Hint::Category("email".to_owned()))
-    .timeout(0)
-    .show().unwrap();
+        .summary(SUMMARY)
+        .body(body)
+        .icon(ICON)
+        .appname(APPNAME)
+        .hint(Hint::Category("email".to_owned()))
+        .timeout(0)
+        .show()
+        .unwrap();
 }
 
 struct ImapServer {
@@ -101,8 +110,20 @@ fn subscribe(imap: ImapServer) {
 
     println!("unseen messages: {:?}", unseen);
 
+    let mut filters: Vec<Filter> = vec![];
+    let mut refilters: Vec<ReFilter> = vec![];
+    filters.push(Filter { subject: r".*に資料が追加されました。".to_string() });
+    filters.push(Filter { subject: r".*さんが.*に参加登録しました。".to_string() });
+    for filter in filters {
+        let re_subject = match Regex::new(filter.subject.as_ref()) {
+            Ok(re) => re,
+            Err(e) => panic!("failed to compile regex: {}", e),
+        };
+        refilters.push(ReFilter { subject: re_subject });
+    }
+
     for message_id in unseen {
-        notify_matching_email(&mut imap_socket, message_id);
+        notify_matching_email(&mut imap_socket, message_id, &refilters);
     }
 
     // match imap_socket.run_command("SEARCH all") {
@@ -123,7 +144,7 @@ fn subscribe(imap: ImapServer) {
 }
 
 
-fn notify_matching_email(imap_socket: &mut IMAPStream, message_id: u32) {
+fn notify_matching_email(imap_socket: &mut IMAPStream, message_id: u32, refilters: &Vec<ReFilter>) {
     let command = format!("FETCH {} rfc822.header", message_id);
     match imap_socket.run_command(command.as_ref()) {
         Ok(response) => {
@@ -188,7 +209,6 @@ fn notify_matching_email(imap_socket: &mut IMAPStream, message_id: u32) {
                 }
                 None => panic!("child.stdin is None"),
             }
-
             let mut subject = String::new();
             match child.stdout {
                 Some(mut stdout) => {
@@ -196,27 +216,20 @@ fn notify_matching_email(imap_socket: &mut IMAPStream, message_id: u32) {
                         Ok(_) => (),
                         Err(e) => panic!("failed to read stdout: {}", e),
                     }
-                    let re = match Regex::new(r".*に資料が追加されました。") {
-                        Ok(re) => re,
-                        Err(e) => panic!("failed to compile regex: {}", e),
-                    };
-                    // let re = match Regex::new(r".*さんが.*に参加登録しました。") {
-                    //     Ok(re) => re,
-                    //     Err(e) => panic!("failed to compile regex: {}", e),
-                    // };
-                    if re.is_match(subject.as_ref()) {
-                        notification(subject.as_ref());
-                        let command = format!("STORE {} +FLAGS (\\Seen)", message_id);
-                        match imap_socket.run_command(command.as_ref()) {
-                            Ok(_) => (),
-                            Err(e) => panic!("failed to run command: {}", e),
-                        }
-                    } else {
-                        println!("subject: {}", subject);
-                    }
                     ()
                 }
                 None => panic!("child.stdout is None"),
+            }
+            for refilter in refilters {
+                if refilter.subject.is_match(subject.as_ref()) {
+                    notification(subject.as_ref());
+                    let command = format!("STORE {} +FLAGS (\\Seen)", message_id);
+                    match imap_socket.run_command(command.as_ref()) {
+                        Ok(_) => (),
+                        Err(e) => panic!("failed to run command: {}", e),
+                    }
+                    break
+                }
             }
         }
         Err(e) => panic!("failed to run command: {}", e),
