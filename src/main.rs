@@ -122,8 +122,22 @@ fn subscribe(imap: ImapServer) {
         refilters.push(ReFilter { subject: re_subject });
     }
 
+    let mut delete_targets: Vec<u32> = vec![];
     for message_id in unseen {
-        notify_matching_email(&mut imap_socket, message_id, &refilters);
+        notify_matching_email(&mut imap_socket,
+                              message_id,
+                              &refilters,
+                              &mut delete_targets);
+    }
+
+    // Deleting messages
+    println!("delete message: {:?}", delete_targets);
+    for message_id in delete_targets {
+        let command = format!("STORE {} +FLAGS (\\Deleted)", message_id);
+        match imap_socket.run_command(command.as_ref()) {
+            Ok(_) => (),
+            Err(e) => panic!("failed to run command: {}", e),
+        }
     }
 
     // match imap_socket.run_command("SEARCH all") {
@@ -144,8 +158,12 @@ fn subscribe(imap: ImapServer) {
 }
 
 
-fn notify_matching_email(imap_socket: &mut IMAPStream, message_id: u32, refilters: &Vec<ReFilter>) {
+fn notify_matching_email(imap_socket: &mut IMAPStream,
+                         message_id: u32,
+                         refilters: &Vec<ReFilter>,
+                         delete_targets: &mut Vec<u32>) {
     let command = format!("FETCH {} rfc822.header", message_id);
+
     match imap_socket.run_command(command.as_ref()) {
         Ok(response) => {
             let mut u8response: Vec<u8> = vec![];
@@ -220,7 +238,7 @@ fn notify_matching_email(imap_socket: &mut IMAPStream, message_id: u32, refilter
                 }
                 None => panic!("child.stdout is None"),
             }
-            for refilter in refilters {
+            for (i, refilter) in refilters.iter().enumerate() {
                 if refilter.subject.is_match(subject.as_ref()) {
                     notification(subject.as_ref());
                     let command = format!("STORE {} +FLAGS (\\Seen)", message_id);
@@ -228,7 +246,11 @@ fn notify_matching_email(imap_socket: &mut IMAPStream, message_id: u32, refilter
                         Ok(_) => (),
                         Err(e) => panic!("failed to run command: {}", e),
                     }
-                    break
+                    delete_targets.push(message_id);
+                    break;
+                }
+                if i == refilters.len() - 1 {
+                    println!("no processing message_id: {}", message_id);
                 }
             }
         }
