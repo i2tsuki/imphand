@@ -10,6 +10,7 @@ use notify_rust::Notification;
 use notify_rust::NotificationHint as Hint;
 use openssl::ssl::{SslContext, SslMethod};
 use regex::Regex;
+use std::io::{self, Read, Write};
 
 use std::process;
 use std::str::FromStr;
@@ -135,8 +136,10 @@ fn subscribe(imap: ImapServer) {
             Ok(re) => re,
             Err(e) => panic!("failed to compile regex: {}", e),
         };
-        refilters.push(ReFilter { subject: re_subject,
-        from: re_from});
+        refilters.push(ReFilter {
+            subject: re_subject,
+            from: re_from,
+        });
     }
 
     let mut delete_targets: Vec<u32> = vec![];
@@ -148,12 +151,26 @@ fn subscribe(imap: ImapServer) {
     }
 
     // Deleting messages
-    println!("delete message: {:?}", delete_targets);
-    for message_id in delete_targets {
-        let command = format!("STORE {} +FLAGS (\\Deleted)", message_id);
-        match imap_socket.run_command(command.as_ref()) {
+    while true {
+        let mut input: [u8; 1] = [0];
+        println!("confirm delete message(Y/n): ");
+        match io::stdin().read(&mut input) {
             Ok(_) => (),
-            Err(e) => panic!("failed to run command: {}", e),
+            Err(e) => panic!("failed to read input: {}", e),
+        }
+        println!("input: {:?}", input);
+        if input[0] == 89 || input[0] == 121 {
+            println!("delete message: {:?}", delete_targets);
+            for message_id in delete_targets {
+                let command = format!("STORE {} +FLAGS (\\Deleted)", message_id);
+                match imap_socket.run_command(command.as_ref()) {
+                    Ok(_) => (),
+                    Err(e) => panic!("failed to run command: {}", e),
+                }
+            }
+            break;
+        } else if input[0] == 110 {
+            break;
         }
     }
 
@@ -210,7 +227,6 @@ fn notify_matching_email(imap_socket: &mut IMAPStream,
 
             // FixMe: Using serialize implementation
             // Using regex implementation
-            use std::io::{Read, Write};
 
             // Fetch subject header
             let re = match Regex::new(r"Subject: (?P<value>\S+(\r\n\s+\S+)*)") {
