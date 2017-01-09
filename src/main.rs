@@ -2,6 +2,8 @@ extern crate notify_rust;
 extern crate imap;
 extern crate openssl;
 extern crate regex;
+extern crate libc;
+
 // #[macro_use]
 // extern crate serde;
 
