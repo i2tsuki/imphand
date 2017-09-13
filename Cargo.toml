@@ -1,11 +1,16 @@
 [package]
 authors = ["oktk"]
 name = "imphand"
+publish = false
 version = "0.1.0"
+
+[[bin]]
+name = "imphand"
 
 [dependencies]
 imap = "0.0.6"
 libc = "0.2.18"
+mailparse = "0.5.1"
 notify-rust = "3.2.1"
 openssl = "0.7.13"
 regex = "0.2.0"

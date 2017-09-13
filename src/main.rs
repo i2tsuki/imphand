@@ -2,18 +2,19 @@ extern crate notify_rust;
 extern crate imap;
 extern crate openssl;
 extern crate regex;
-extern crate libc;
+extern crate mailparse;
 
 // #[macro_use]
 // extern crate serde;
 
 use imap::client::IMAPStream;
+use mailparse::*;
 use notify_rust::Notification;
 use notify_rust::NotificationHint as Hint;
 use openssl::ssl::{SslContext, SslMethod};
 use regex::Regex;
-use std::io::{self, Read, Write};
 
+use std::io::{self, Read};
 use std::process;
 use std::str::FromStr;
 
@@ -65,10 +66,17 @@ struct ImapServer {
 }
 
 fn subscribe(imap: ImapServer) {
-    let mut imap_socket = IMAPStream::connect((imap.server.as_ref(), imap.port),
-                                              Some(SslContext::new(SslMethod::Sslv23).unwrap()))
+    let mut imap_socket = match IMAPStream::connect(
+        (imap.server.as_ref(), imap.port),
+        Some(SslContext::new(SslMethod::Sslv23).unwrap()),
+    ) {
+        Ok(socket) => socket,
+        Err(e) => panic!("failed to connect to the server: {}", e),
+    };
+
+    imap_socket
+        .login(imap.username.as_ref(), imap.password.as_ref())
         .unwrap();
-    imap_socket.login(imap.username.as_ref(), imap.password.as_ref()).unwrap();
 
     // match imap_socket.capability() {
     //     Ok(capabilities) => {
@@ -146,14 +154,16 @@ fn subscribe(imap: ImapServer) {
 
     let mut delete_targets: Vec<u32> = vec![];
     for message_id in unseen {
-        notify_matching_email(&mut imap_socket,
-                              message_id,
-                              &refilters,
-                              &mut delete_targets);
+        notify_matching_email(
+            &mut imap_socket,
+            message_id,
+            &refilters,
+            &mut delete_targets,
+        );
     }
 
     // Deleting messages
-    while true {
+    loop {
         let mut input: [u8; 1] = [0];
         println!("confirm delete message(Y/n): ");
         match io::stdin().read(&mut input) {
@@ -194,10 +204,12 @@ fn subscribe(imap: ImapServer) {
 }
 
 
-fn notify_matching_email(imap_socket: &mut IMAPStream,
-                         message_id: u32,
-                         refilters: &Vec<ReFilter>,
-                         delete_targets: &mut Vec<u32>) {
+fn notify_matching_email(
+    imap_socket: &mut IMAPStream,
+    message_id: u32,
+    refilters: &Vec<ReFilter>,
+    delete_targets: &mut Vec<u32>,
+) {
     let command = format!("FETCH {} rfc822.header", message_id);
 
     match imap_socket.run_command(command.as_ref()) {
@@ -211,9 +223,24 @@ fn notify_matching_email(imap_socket: &mut IMAPStream,
                     }
                 }
             }
-            let s = String::from_utf8(u8response.clone()).unwrap();
-            // Debug message
-            // println!("u8response: {}", s);
+            let mut subject = "".to_string();
+            let mut from = "".to_string();
+            let parsed = parse_mail(&u8response[..]).unwrap();
+            for header in parsed.headers {
+                let key = header.get_key().unwrap();
+                match &*key {
+                    "From" => {
+                        from = header.get_value().unwrap().replace(" ", "");
+                    }
+                    "Subject" => {
+                        subject = header.get_value().unwrap().replace(" ", "");
+                    }
+                    _ => {}
+
+                }
+                if header.get_key().unwrap() == "Subject" {}
+            }
+            println!("{}, {}", subject, from);
 
             // Using serialize implementation
             // use std::collections::HashMap;
@@ -227,100 +254,7 @@ fn notify_matching_email(imap_socket: &mut IMAPStream,
             // };
             // println!("{:?}", r);
 
-            // FixMe: Using serialize implementation
-            // Using regex implementation
-
-            // Fetch subject header
-            let re = match Regex::new(r"Subject: (?P<value>\S+(\r\n\s+\S+)*)") {
-                Ok(re) => re,
-                Err(e) => panic!("failed to compile regex: {}", e),
-            };
-            let value = match re.captures(s.as_ref()) {
-                Some(caps) => {
-                    match caps.name("value") {
-                        Some(cap) => cap.as_str(),
-                        None => "",
-                    }
-                }
-                None => "",
-            };
-            let value = value.to_string().replace("\r\n", "");
-            let value = value.to_string().replace(" ", "");
-            let child = match process::Command::new("nkf")
-                .args(&["-w"])
-                .stdin(process::Stdio::piped())
-                .stdout(process::Stdio::piped())
-                .spawn() {
-                Ok(child) => child,
-                Err(e) => panic!("failed to spawn process: {}", e),
-            };
-            match child.stdin {
-                Some(mut stdin) => {
-                    match stdin.write_all(&value.as_bytes()) {
-                        Ok(_) => (),
-                        Err(e) => panic!("failed to write child.stdin: {}", e),
-                    }
-                }
-                None => panic!("child.stdin is None"),
-            }
-            let mut subject = String::new();
-            match child.stdout {
-                Some(mut stdout) => {
-                    match stdout.read_to_string(&mut subject) {
-                        Ok(_) => (),
-                        Err(e) => panic!("failed to read stdout: {}", e),
-                    }
-                    ()
-                }
-                None => panic!("child.stdout is None"),
-            }
-
-            // Fetch from header
-            let re = match Regex::new(r"From: .*<(?P<value>.*)>") {
-                Ok(re) => re,
-                Err(e) => panic!("failed to compile regex: {}", e),
-            };
-            let value = match re.captures(s.as_ref()) {
-                Some(caps) => {
-                    match caps.name("value") {
-                        Some(cap) => cap.as_str(),
-                        None => "",
-                    }
-                }
-                None => "",
-            };
-            let value = value.to_string().replace("\r\n", "");
-            let value = value.to_string().replace(" ", "");
-            let child = match process::Command::new("nkf")
-                .args(&["-w"])
-                .stdin(process::Stdio::piped())
-                .stdout(process::Stdio::piped())
-                .spawn() {
-                Ok(child) => child,
-                Err(e) => panic!("failed to spawn process: {}", e),
-            };
-            match child.stdin {
-                Some(mut stdin) => {
-                    match stdin.write_all(&value.as_bytes()) {
-                        Ok(_) => (),
-                        Err(e) => panic!("failed to write child.stdin: {}", e),
-                    }
-                }
-                None => panic!("child.stdin is None"),
-            }
-            let mut from = String::new();
-            match child.stdout {
-                Some(mut stdout) => {
-                    match stdout.read_to_string(&mut from) {
-                        Ok(_) => (),
-                        Err(e) => panic!("failed to read stdout: {}", e),
-                    }
-                    ()
-                }
-                None => panic!("child.stdout is None"),
-            }
-
-            for (i, refilter) in refilters.iter().enumerate() {
+            for (_, refilter) in refilters.iter().enumerate() {
                 if refilter.subject.is_match(subject.as_ref()) && refilter.from.is_match(from.as_str()) {
                     notification(subject.as_ref());
                     let command = format!("STORE {} +FLAGS (\\Seen)", message_id);
@@ -330,9 +264,6 @@ fn notify_matching_email(imap_socket: &mut IMAPStream,
                     }
                     delete_targets.push(message_id);
                     break;
-                }
-                if i == refilters.len() - 1 {
-                    println!("no processing message_id: {}", message_id);
                 }
             }
         }
