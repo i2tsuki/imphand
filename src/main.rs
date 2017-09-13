@@ -15,11 +15,12 @@ use openssl::ssl::{SslContext, SslMethod};
 use regex::Regex;
 
 use std::io::{self, Read};
-use std::process;
 use std::str::FromStr;
 
 // mod serde_email;
 // use serde_email::de;
+
+mod app;
 
 const SUMMARY: &'static str = "Category:email";
 const ICON: &'static str = "thunderbird-bin-icon";
@@ -36,14 +37,8 @@ struct ReFilter {
 }
 
 fn main() {
-    let imap = ImapServer {
-        server: "example.com".to_string(),
-        port: 993,
-        username: "example@example.com".to_string(),
-        password: "example".to_string(),
-    };
-
-    subscribe(imap);
+    let server = app::imap_server();
+    subscribe(server);
 }
 
 fn notification(body: &str) {
@@ -58,14 +53,7 @@ fn notification(body: &str) {
         .unwrap();
 }
 
-struct ImapServer {
-    server: String,
-    port: u16,
-    username: String,
-    password: String,
-}
-
-fn subscribe(imap: ImapServer) {
+fn subscribe(imap: app::ImapServer) {
     let mut imap_socket = match IMAPStream::connect(
         (imap.server.as_ref(), imap.port),
         Some(SslContext::new(SslMethod::Sslv23).unwrap()),
@@ -77,15 +65,6 @@ fn subscribe(imap: ImapServer) {
     imap_socket
         .login(imap.username.as_ref(), imap.password.as_ref())
         .unwrap();
-
-    // match imap_socket.capability() {
-    //     Ok(capabilities) => {
-    //         for capability in capabilities.iter() {
-    //             println!("{}", capability);
-    //         }
-    //     }
-    //     Err(e) => println!("Error parsing capability: {}", e),
-    // };
 
     // match imap_socket.run_command("LIST \"\" \"*\"") {
     //     Ok(response) => {
