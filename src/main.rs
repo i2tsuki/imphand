@@ -1,11 +1,13 @@
-extern crate notify_rust;
 extern crate imap;
+extern crate mailparse;
+extern crate notify_rust;
 extern crate openssl;
 extern crate regex;
-extern crate mailparse;
 
-// #[macro_use]
-// extern crate serde;
+#[macro_use]
+extern crate log;
+#[macro_use]
+extern crate serde_derive;
 
 use imap::client::IMAPStream;
 use mailparse::*;
@@ -13,32 +15,36 @@ use notify_rust::Notification;
 use notify_rust::NotificationHint as Hint;
 use openssl::ssl::{SslContext, SslMethod};
 use regex::Regex;
-
-use std::io::{self, Read};
+use std::collections::HashMap;
+use std::process;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // mod serde_email;
 // use serde_email::de;
 
 mod app;
+mod config;
 
 const SUMMARY: &'static str = "Category:email";
 const ICON: &'static str = "thunderbird-bin-icon";
 const APPNAME: &'static str = "imphand";
 
-struct Filter {
-    subject: String,
-    from: String,
-}
-
+#[derive(Debug)]
 struct ReFilter {
-    subject: Regex,
-    from: Regex,
+    mark: Vec<String>,
+    subject: Option<Regex>,
+    from: Option<Regex>,
+    notification: bool,
+    label: Option<String>,
 }
 
 fn main() {
-    let server = app::imap_server();
-    subscribe(server);
+    let app = app::new();
+    let config = config::new(app.config_file).unwrap();
+    for (_name, account) in config.account {
+        subscribe(account);
+    }
 }
 
 fn notification(body: &str) {
@@ -53,174 +59,124 @@ fn notification(body: &str) {
         .unwrap();
 }
 
-fn subscribe(imap: app::ImapServer) {
-    let mut imap_socket = match IMAPStream::connect(
-        (imap.server.as_ref(), imap.port),
-        Some(SslContext::new(SslMethod::Sslv23).unwrap()),
-    ) {
+fn subscribe(account: config::Account) {
+    let mut count: HashMap<String, i64> = HashMap::new();
+
+    let server: Vec<&str> = account.server.split(':').collect();
+    let server: (&str, u16) = (server[0], server[1].parse().unwrap());
+
+    let mut socket = match IMAPStream::connect(server, Some(SslContext::new(SslMethod::Sslv23).unwrap())) {
         Ok(socket) => socket,
         Err(e) => panic!("failed to connect to the server: {}", e),
     };
 
-    imap_socket
-        .login(imap.username.as_ref(), imap.password.as_ref())
+    socket
+        .login(&*account.username, &*account.password)
         .unwrap();
 
-    // match imap_socket.run_command("LIST \"\" \"*\"") {
-    //     Ok(response) => {
-    //         for line in response {
-    //             print!("{}", line);
-    //         }
-    //     }
-    //     Err(e) => print!("Error run command: {}", e),
-    // }
 
-    match imap_socket.run_command("SELECT Inbox") {
-        Ok(response) => {
-            for line in response {
-                print!("{}", line);
-            }
-        }
-        Err(e) => print!("Error run command: {}", e),
-    }
-
-    let mut unseen: Vec<u32> = vec![];
-    match imap_socket.run_command("FETCH 1:* flags") {
-        Ok(response) => {
-            for line in response {
-                let re = Regex::new(r"\* (\d+) FETCH \(FLAGS \(\)\)").unwrap();
-                match re.captures(line.as_ref()) {
-                    Some(caps) => {
-                        unseen.push(u32::from_str(caps.get(1).unwrap().as_str()).unwrap());
-                    }
-                    None => (),
-                };
-            }
-        }
-        Err(e) => print!("Error run command: {}", e),
-    }
-
-    println!("unseen messages: {:?}", unseen);
-
-    let mut filters: Vec<Filter> = vec![];
-    let mut refilters: Vec<ReFilter> = vec![];
-    filters.push(Filter {
-        subject: r".*に資料が追加されました。".to_string(),
-        from: r"no-reply@connpass.com".to_string(),
-    });
-    filters.push(Filter {
-        subject: r".*さんが.*に参加登録しました。".to_string(),
-        from: r"no-reply@connpass.com".to_string(),
-    });
-    filters.push(Filter {
-        subject: r".*が.*を公開しました".to_string(),
-        from: r"no-reply@connpass.com".to_string(),
-    });
-    for filter in filters {
-        let re_subject = match Regex::new(filter.subject.as_ref()) {
-            Ok(re) => re,
-            Err(e) => panic!("failed to compile regex: {}", e),
-        };
-        let re_from = match Regex::new(filter.from.as_ref()) {
-            Ok(re) => re,
-            Err(e) => panic!("failed to compile regex: {}", e),
-        };
-        refilters.push(ReFilter {
-            subject: re_subject,
-            from: re_from,
-        });
-    }
-
-    let mut delete_targets: Vec<u32> = vec![];
-    for message_id in unseen {
-        notify_matching_email(
-            &mut imap_socket,
-            message_id,
-            &refilters,
-            &mut delete_targets,
-        );
-    }
-
-    // Deleting messages
-    loop {
-        let mut input: [u8; 1] = [0];
-        println!("confirm delete message(Y/n): ");
-        match io::stdin().read(&mut input) {
+    for folder in account.folder {
+        let mut refilter: Vec<ReFilter> = vec![];
+        match socket.run_command(&format!("SELECT {}", folder.name)) {
             Ok(_) => (),
-            Err(e) => panic!("failed to read input: {}", e),
+            Err(e) => print!("Error run command: {}", e),
         }
-        println!("input: {:?}", input);
-        if input[0] == 89 || input[0] == 121 {
-            println!("delete message: {:?}", delete_targets);
-            for message_id in delete_targets {
-                let command = format!("STORE {} +FLAGS (\\Deleted)", message_id);
-                match imap_socket.run_command(command.as_ref()) {
-                    Ok(_) => (),
-                    Err(e) => panic!("failed to run command: {}", e),
+
+        for filter in &account.filter[&folder.key] {
+            match filter.label.clone() {
+                Some(label) => {
+                    if !count.contains_key(&label) {
+                        count.insert(label, 0);
+                    }
+                }
+                None => (),
+            }
+
+            let filter = ReFilter {
+                mark: filter.mark.clone(),
+                subject: Some(Regex::new(&*filter.clone().subject.unwrap()).unwrap()),
+                from: match filter.clone().from {
+                    Some(from) => Some(Regex::new(from.as_ref()).unwrap()),
+                    None => None,
+                },
+                notification: filter.notification,
+                label: filter.label.clone(),
+            };
+            refilter.push(filter);
+        }
+
+        let re = Regex::new(
+            r"\* (\d+) FETCH \(FLAGS \((\s?|NonJunk|\\Seen|NonJunk \\Seen)\)\)",
+        ).unwrap();
+        match socket.run_command(&format!("FETCH {} {}", "1:*", "FLAGS")) {
+            Ok(resp) => {
+                info!("{:?}", resp);
+                for line in resp {
+                    match re.captures(&line) {
+                        Some(caps) => {
+                            let id = u16::from_str(caps.get(1).unwrap().as_str()).unwrap();
+                            count = notify_matching_email(&mut socket, id, &refilter, count);
+                        }
+                        None => {
+                            info!("unmatch: {}", line.replace("\n", ""));
+                        }
+                    };
                 }
             }
-            break;
-        } else if input[0] == 110 {
-            break;
+            Err(e) => print!("Error run command: {}", e),
         }
     }
-
-    // match imap_socket.run_command("SEARCH all") {
-    //     Ok(response) => {
-    //         for line in response {
-    //             print!("{}", line);
-    //         }
-    //     }
-    //     Err(e) => print!("Error run command: {}", e),
-    // }
-
-    // match imap_socket.select("Inbox") {
-    //     Ok(mailbox) => {
-    //         println!("{:?}", mailbox.unseen);
-    //     }
-    //     Err(e) => println!("Error selecting INBOX: {}", e),
-    // };
+    let epoch = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(now) => now.as_secs(),
+        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+    };
+    for (key, value) in &count {
+        println!("{}\t{}\t{}", key, value, epoch);
+    }
 }
 
+fn mark_email(socket: &mut IMAPStream, id: u16, mark: &Vec<String>) -> bool {
+    if mark.contains(&"seen".to_string()) {
+        match socket.run_command(&*format!("STORE {} {}", id, "+FLAGS (\\Seen)")) {
+            Ok(_) => (),
+            Err(e) => panic!("failed to run command: {}", e),
+        }
+    }
+    if mark.contains(&"delete".to_string()) {
+        match socket.run_command(&*format!("STORE {} {}", id, "+FLAGS (\\Deleted)")) {
+            Ok(_) => (),
+            Err(e) => panic!("failed to run command: {}", e),
+        }
+        return true;
+    }
+    false
+}
 
-fn notify_matching_email(
-    imap_socket: &mut IMAPStream,
-    message_id: u32,
-    refilters: &Vec<ReFilter>,
-    delete_targets: &mut Vec<u32>,
-) {
-    let command = format!("FETCH {} rfc822.header", message_id);
-
-    match imap_socket.run_command(command.as_ref()) {
-        Ok(response) => {
-            let mut u8response: Vec<u8> = vec![];
-            for line in response {
-                let re = Regex::new(r"\* (\d+) FETCH .*").unwrap();
-                if !re.is_match(line.as_ref()) {
-                    for u in line.as_bytes() {
-                        u8response.push(*u);
-                    }
-                }
-            }
+fn notify_matching_email<'a>(
+    socket: &mut IMAPStream,
+    id: u16,
+    filter: &Vec<ReFilter>,
+    mut count: HashMap<String, i64>,
+) -> (HashMap<String, i64>) {
+    match socket.run_command(&format!("FETCH {} {}", id, "rfc822.header")) {
+        Ok(resp) => {
+            let body: String = resp.into_iter().collect();
             let mut subject = "".to_string();
             let mut from = "".to_string();
-            let parsed = parse_mail(&u8response[..]).unwrap();
+            let index = body.find('\n').unwrap();
+            let (_, body) = body.split_at(index + 1);
+            let index = body.rfind(')').unwrap();
+            let (body, _) = body.split_at(index + 1);
+            let parsed = parse_mail(body.as_bytes()).unwrap();
             for header in parsed.headers {
                 let key = header.get_key().unwrap();
                 match &*key {
-                    "From" => {
-                        from = header.get_value().unwrap().replace(" ", "");
-                    }
-                    "Subject" => {
-                        subject = header.get_value().unwrap().replace(" ", "");
-                    }
+                    "From" => from = header.get_value().unwrap(),
+                    "Subject" => subject = header.get_value().unwrap(),
                     _ => {}
 
                 }
-                if header.get_key().unwrap() == "Subject" {}
             }
-            println!("{}, {}", subject, from);
-
             // Using serialize implementation
             // use std::collections::HashMap;
             // type RFC822 = HashMap<String, String>;
@@ -231,21 +187,71 @@ fn notify_matching_email(
             //         process::exit(1);
             //     }
             // };
-            // println!("{:?}", r);
 
-            for (_, refilter) in refilters.iter().enumerate() {
-                if refilter.subject.is_match(subject.as_ref()) && refilter.from.is_match(from.as_str()) {
-                    notification(subject.as_ref());
-                    let command = format!("STORE {} +FLAGS (\\Seen)", message_id);
-                    match imap_socket.run_command(command.as_ref()) {
-                        Ok(_) => (),
-                        Err(e) => panic!("failed to run command: {}", e),
+            let mut flag = false;
+            for f in filter {
+                for obj in vec![(subject.as_ref(), &f.subject), (from.as_ref(), &f.from)] {
+                    match *obj.1 {
+                        Some(ref m) => {
+                            if m.is_match(obj.0) {
+                                flag = true
+                            } else {
+                                flag = false;
+                                break;
+                            }
+                        }
+                        None => (),
                     }
-                    delete_targets.push(message_id);
-                    break;
+                }
+                if flag {
+                    info!("subject: {}, from: {}", subject, from);
+                    match f.label {
+                        Some(ref label) => {
+                            if let Some(x) = count.get_mut(label) {
+                                *x = *x + 1;
+                            }
+                        }
+                        None => (),
+                    }
+                    if f.notification {
+                        notification(subject.as_ref());
+                    }
+                    if mark_email(socket, id, &f.mark) {
+                        break;
+                    }
                 }
             }
+
+            // for (_, filter) in filter.iter().enumerate() {
+            //     match filter.subject {
+            //         Some(f_subject) => match filter.from {
+            //             Some(f_from) => {
+            //                 if f_subject.is_match(&subject) && f_from.is_match(&from) {
+            //                     println!("subject: {}, from: {}", subject, from);
+            //                     if filter.notification {
+            //                         notification(subject.as_ref());
+            //                     }
+            //                     if mark_email(socket, id, &filter.mark) {
+            //                         break;
+            //                     }
+            //                 }
+            //             },
+            //             None => {
+            //             }
+            //         }
+            //     }
+
+            //     }
+
+            //     match filter.from {
+            //         Some(from) => {
+            //             if
+            //         }
+            //     }
+
+            // }
         }
         Err(e) => panic!("failed to run command: {}", e),
     }
+    return count;
 }
